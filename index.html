@@ -305,6 +305,11 @@ let selectedModules = new Set(questions.map(q => q.section));
 let statusMode = 'all';
 let clearArmed = false;
 let saveTimer = null;
+/* Questions whose work was deliberately cleared (Reset & retry, Reset Answers).
+   A payload lists only questions that HAVE state, so without this a cleared
+   question is indistinguishable from one never touched -- and a merge with the
+   other side's older copy would hand the old answer straight back. */
+let clearedKeys = new Set();
 const STORAGE_KEY = 'intro_periodontics_quiz_progress';
 const SAVE_VERSION = 2;                  // 1 = progress keyed by array index
 
@@ -335,7 +340,13 @@ const SYNC_ON = !!(SYNC.url && SYNC.anonKey && SYNC.url.indexOf('http') === 0);
 const LEGACY_KEYS = {};
 
 // ---------- localStorage persistence ----------
-function loadProgress(){
+/* `view` restores which topics are ticked, the active filter and the retry set.
+   That is this device's view of the quiz, not progress, so it is restored from
+   this browser's own save at startup and never from a payload that arrived over
+   the network -- otherwise another device's (or an earlier) selection keeps
+   reappearing over the one in front of you. */
+function loadProgress(opts){
+  const withView = !opts || opts.view !== false;
   let raw;
   try { raw = localStorage.getItem(STORAGE_KEY); } catch(e){ return; }
   if(!raw) return;
@@ -357,6 +368,16 @@ function loadProgress(){
     questions.forEach(q => {
       const saved = byKey.get(q.key);
       if(!saved) return;
+      if(saved.cleared){
+        // A tombstone: this question was answered once and then deliberately
+        // cleared. Keep it cleared, and keep remembering that, so the next save
+        // still carries the tombstone and the clear is not undone by a merge.
+        clearedKeys.add(q.key);
+        q.selected = null; q.revealed = false; q.struck = [];
+        if(isLabel(q)){ q.placed = {}; q.userPlaced = false; }
+        q.flagged = !!saved.flagged;
+        return;
+      }
       // A saved entry only carries the fields that were actually set, so coalesce
       // rather than assigning undefined into the question's state.
       q.selected = (saved.selected === undefined) ? null : saved.selected;
@@ -375,22 +396,35 @@ function loadProgress(){
         }
       }
     });
-    if(data.selectedModules) selectedModules = new Set(data.selectedModules);
-    // Topics added since this save was made are switched ON automatically, so new
-    // material is never hidden behind a filter saved by an older version.
-    const knownAtSave = Array.isArray(data.knownSections)
-      ? new Set(data.knownSections)
-      : new Set(data.selectedModules || []);
-    questions.forEach(q => { if(!knownAtSave.has(q.section)) selectedModules.add(q.section); });
-    if(Array.isArray(data.retrySet)) retrySet = data.retrySet;
-    if(data.statusMode) statusMode = data.statusMode;
-    if(statusMode === 'retry' && !retrySet.length) statusMode = 'all';
-    const banner = document.getElementById('saveBanner');
-    const text = document.getElementById('saveBannerText');
-    const ago = getTimeAgo(new Date(data.savedAt));
-    text.textContent = `✓ Progress loaded (saved ${ago})`;
-    banner.style.display = 'flex';
+    if(withView){
+      if(data.selectedModules) selectedModules = new Set(data.selectedModules);
+      // Topics added since this save was made are switched ON automatically, so new
+      // material is never hidden behind a filter saved by an older version. A save
+      // with no knownSections predates the field; treat every current section as
+      // known rather than guessing, or a narrowed selection would be blown open.
+      if(Array.isArray(data.knownSections)){
+        const knownAtSave = new Set(data.knownSections);
+        questions.forEach(q => { if(!knownAtSave.has(q.section)) selectedModules.add(q.section); });
+      }
+      if(Array.isArray(data.retrySet)) retrySet = normalizeRetrySet(data.retrySet);
+      if(data.statusMode) statusMode = data.statusMode;
+      if(statusMode === 'retry' && !retrySet.length) statusMode = 'all';
+      const banner = document.getElementById('saveBanner');
+      const text = document.getElementById('saveBannerText');
+      const ago = getTimeAgo(new Date(data.savedAt));
+      text.textContent = `✓ Progress loaded (saved ${ago})`;
+      banner.style.display = 'flex';
+    }
   } catch(e){}
+}
+
+/* The retry set is stored as question keys. Older saves stored array positions,
+   which point at a different question the moment the bank is rebuilt, and a save
+   does not say which build wrote it -- so a number is dropped rather than
+   guessed at. The set empties, the view falls back to All, and no answer moves. */
+function normalizeRetrySet(list){
+  const keys = new Set(questions.map(q => q.key));
+  return list.filter(v => typeof v === 'string' && keys.has(v));
 }
 
 /* One question's saved state, or null when it has none worth keeping. Only
@@ -400,6 +434,11 @@ function loadProgress(){
 function questionState(q){
   const st = { key: q.key };
   let any = false;
+  if (clearedKeys.has(q.key) && !hasWork(q)){
+    st.cleared = true;
+    if (q.flagged) st.flagged = true;
+    return st;
+  }
   if (q.selected !== null && q.selected !== undefined){ st.selected = q.selected; any = true; }
   if (q.flagged){ st.flagged = true; any = true; }
   if (q.revealed){ st.revealed = true; any = true; }
@@ -413,6 +452,8 @@ function questionState(q){
 }
 
 function buildPayload(){
+  // A question that has been worked on again is no longer "cleared".
+  questions.forEach(q => { if (hasWork(q)) clearedKeys.delete(q.key); });
   return {
     v: SAVE_VERSION,
     questions: questions.map(questionState).filter(Boolean),
@@ -474,6 +515,14 @@ function displayName(user){
    union; a genuine conflict (both devices answered the same question) is
    settled by which payload was saved later. */
 function mergeQuestion(older, newer){
+  // A clear is an edit like any other: the later side wins. Without this the
+  // union below would hand back the answer the person just reset, which is what
+  // made "Reset & retry" undo itself on the next sync.
+  if (newer.cleared){
+    const t = { key: newer.key, cleared: true };
+    if (older.flagged || newer.flagged) t.flagged = true;
+    return t;
+  }
   const m = { key: newer.key };
   ['selected', 'revealed', 'userPlaced', 'chipOrder'].forEach(f => {
     const v = (newer[f] !== undefined) ? newer[f] : older[f];
@@ -503,23 +552,36 @@ function mergeProgress(a, b){
   return {
     v: SAVE_VERSION,
     questions: Array.from(map.values()),
-    // A topic switched on anywhere stays on: hiding a section someone is using
-    // is worse than showing one they had filtered out.
-    selectedModules: Array.from(new Set([].concat(older.selectedModules || [], newer.selectedModules || []))),
+    // View state is per-device and is never merged: unioning the ticked topics
+    // meant any topic ever switched on anywhere came back on, so narrowing the
+    // selection on one device was undone by its own next sync. applyPayload
+    // stamps this device's live view over these before anything is stored.
+    selectedModules: newer.selectedModules || older.selectedModules || [],
+    // knownSections IS cumulative -- it records which sections a save had seen,
+    // and is what makes a newly added topic switch itself on.
     knownSections: Array.from(new Set([].concat(older.knownSections || [], newer.knownSections || []))),
     statusMode: newer.statusMode || older.statusMode || 'all',
-    retrySet: newer.retrySet && newer.retrySet.length ? newer.retrySet : (older.retrySet || []),
+    retrySet: newer.retrySet || older.retrySet || [],
     savedAt: newer.savedAt
   };
 }
 
+/* Fold a merged payload into the page. Progress is replaced; the view -- ticked
+   topics, active filter, retry set -- is this device's and is left alone, and is
+   written back into the payload so a later reload reads it back unchanged. */
 function applyPayload(data){
+  data = Object.assign({}, data, {
+    selectedModules: Array.from(selectedModules),
+    statusMode: statusMode,
+    retrySet: retrySet
+  });
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e){}
   questions.forEach(q => {
     q.selected = null; q.flagged = false; q.revealed = false;
     q.struck = []; q.placed = {}; q.userPlaced = false;
   });
-  loadProgress();
+  clearedKeys = new Set();
+  loadProgress({ view: false });
   document.querySelectorAll('.topic-cb').forEach(cb => { cb.checked = selectedModules.has(cb.value); });
   renderQuiz(); updateScore(); updateCounts();
 }
@@ -574,8 +636,19 @@ async function pushNow(payload){
       user_id: sbUser.id, quiz_id: SYNC.quizId, payload: merged, updated_at: new Date().toISOString()
     }, { onConflict: 'user_id,quiz_id' });
     if (error) throw error;
-    // if the merge brought something back, show it rather than silently holding it
-    if (merged !== mine && merged.questions.length > mine.questions.length) applyPayload(merged);
+    // Keep this browser's copy in step with what was just stored, but do NOT
+    // re-render: a background push must never redraw the quiz under someone who
+    // is part-way through answering. Work done on another device shows up at the
+    // next sign-in or reload, when applyPayload runs at a natural break.
+    if (merged !== mine){
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.assign({}, merged, {
+          selectedModules: Array.from(selectedModules),
+          statusMode: statusMode,
+          retrySet: retrySet
+        })));
+      } catch(e){}
+    }
     syncStatus('Synced', 'ok');
   } catch(e){
     syncStatus('Offline - saved on this device', 'warn');
@@ -676,16 +749,25 @@ function clearAllData(){
   }
   clearArmed = false;
   retrySet = [];
+  clearedKeys = new Set();
   try { localStorage.removeItem(STORAGE_KEY); } catch(e){}
   questions.forEach(q => { q.selected = null; q.flagged = false; q.revealed = false; q.struck = [];
     if (isLabel(q)){ q.placed = {}; q.userPlaced = false; q.chipOrder = null; } });
   selectedModules = new Set(questions.map(q => q.section));
   statusMode = 'all';
   document.getElementById('saveStatus').textContent = 'All saved data cleared';
-  setTimeout(() => {
-    document.getElementById('saveStatus').textContent = '';
-    location.reload();
-  }, 1500);
+  // Clearing only this browser would be undone the moment the account syncs
+  // again, so when signed in the stored row is emptied too.
+  const wipe = (sb && sbUser)
+    ? (clearTimeout(pushTimer), pushNow({
+        v: SAVE_VERSION, questions: [],
+        selectedModules: Array.from(selectedModules),
+        knownSections: Array.from(new Set(questions.map(q => q.section))),
+        statusMode: 'all', retrySet: [], savedAt: new Date().toISOString()
+      }).catch(() => {}))
+    : Promise.resolve();
+  const reload = () => { document.getElementById('saveStatus').textContent = ''; location.reload(); };
+  Promise.race([wipe, new Promise(r => setTimeout(r, 4000))]).then(() => setTimeout(reload, 800));
 }
 
 function getTimeAgo(d){
@@ -725,7 +807,7 @@ function selectNoneModules(){
 
 function passesFilter(q){
   if (!selectedModules.has(q.section)) return false;
-  if (statusMode === 'retry') return retrySet.indexOf(q.id) !== -1;
+  if (statusMode === 'retry') return retrySet.indexOf(q.key) !== -1;
   if (statusMode === 'incorrect'){
     if (isLabel(q)) return labelIsComplete(q) && !labelIsCorrect(q);
     return q.selected != null && q.selected !== q.ans;
@@ -923,6 +1005,7 @@ function resetQuiz(){
   retrySet = [];
   if (statusMode === 'retry') statusMode = 'all';
   questions.forEach(q => {
+    if (hasWork(q)) clearedKeys.add(q.key);   // so the reset survives a sync
     q.selected = null; q.revealed = false; q.struck = [];
     if (isLabel(q)){ q.placed = {}; q.userPlaced = false; q.chipOrder = null; }
   });
@@ -934,8 +1017,9 @@ function resetQuiz(){
 }
 
 function shuffleQuiz(){
-  retrySet = [];                       // ids are reassigned below, so the old set no longer maps
+  retrySet = [];                       // a shuffle is a fresh start, not a retry round
   if (statusMode === 'retry') statusMode = 'all';
+  questions.forEach(q => { if (hasWork(q)) clearedKeys.add(q.key); });
   // Shuffle the questions array order
   for (let i=questions.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [questions[i],questions[j]]=[questions[j],questions[i]]; }
   // Reassign question IDs to match new positions (CRITICAL: prevents answer misalignment)
@@ -1273,6 +1357,7 @@ function hasWork(q){
 }
 
 function clearOne(q){
+  if (hasWork(q)) clearedKeys.add(q.key);   // so the clear survives a sync
   q.selected = null; q.revealed = false; q.struck = [];
   if (isLabel(q)){ q.placed = {}; q.userPlaced = false; }
 }
@@ -1283,7 +1368,7 @@ function clearOne(q){
 function retryVisible(){
   const vis = questions.filter(q => passesFilter(q) && hasWork(q));
   if (!vis.length) return;
-  retrySet = vis.map(q => q.id);
+  retrySet = vis.map(q => q.key);   // keys, not positions: a shuffle moves ids
   const from = statusMode === 'flagged' ? 'flagged' : 'incorrect';
   vis.forEach(clearOne);
   statusMode = 'retry';
