@@ -247,7 +247,6 @@ footer{max-width:980px;margin:0 auto 40px;padding:0 16px;color:var(--muted);font
   .meter .fig{text-align:left;}
 }
 </style>
-<meta name="robots" content="noindex, nofollow">
 </head>
 <body>
 <header>
@@ -274,6 +273,7 @@ footer{max-width:980px;margin:0 auto 40px;padding:0 16px;color:var(--muted);font
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
       <button class="ghost" onclick="resetQuiz()">Reset Answers</button>
       <button class="ghost" onclick="shuffleQuiz()">Shuffle</button>
+      <button class="ghost" id="orderBtn" style="display:none" onclick="restoreOrder()">Original order</button>
       <button class="ghost" onclick="showAnswers()">Show All Answers</button>
       <button class="retry-btn" id="retryBtn" style="display:none" onclick="retryVisible()"></button>
       <button class="ghost" id="insightsBtn" onclick="toggleInsights()">📊 Insights</button>
@@ -465,6 +465,62 @@ const SYNC_ON = !!(SYNC.url && SYNC.anonKey && SYNC.url.indexOf('http') === 0);
 // switch still lands on the question it belongs to. Empty for a first build.
 const LEGACY_KEYS = {};
 
+/* The order the build published: which questions came in which order, and the
+   options within each. Shuffle rearranges the live copy, so this is the fixed
+   reference a saved arrangement is described against. */
+const BUILD_ORDER = questions.map(q => q.key);
+const ORIG = {};
+questions.forEach(q => { ORIG[q.key] = { opts: (q.opts || []).slice(), ans: q.ans }; });
+
+/* ---------- the arrangement ------------------------------------------------
+   Shuffle used to last only until the page was reloaded, and reshuffling threw
+   away every answer, so there was no way to work through the bank in a random
+   order across sittings. The arrangement is now saved: the order of the
+   questions, and the order of the options inside each one. It is view state,
+   kept per device like the topic filter -- answers are stored by their text, so
+   a phone reading this device's progress does not need its shuffle. */
+function currentArrangement(){
+  const opts = {};
+  questions.forEach(q => {
+    if (q.type === 'label' || !ORIG[q.key]) return;
+    const orig = ORIG[q.key].opts;
+    const perm = q.opts.map(t => orig.indexOf(t));
+    if (perm.some((v, i) => v !== i) && perm.every(v => v >= 0)) opts[q.key] = perm;
+  });
+  const order = questions.map(q => q.key);
+  const shuffled = order.some((k, i) => k !== BUILD_ORDER[i]);
+  return { order: shuffled ? order : null, opts: opts };
+}
+
+function applyArrangement(arr){
+  if (!arr) return;
+  if (Array.isArray(arr.order) && arr.order.length){
+    const byKey = new Map(questions.map(q => [q.key, q]));
+    const seen = new Set();
+    const out = [];
+    arr.order.forEach(k => { const q = byKey.get(k); if (q && !seen.has(k)){ out.push(q); seen.add(k); } });
+    // questions added by a later build are not in the saved order; keep them,
+    // in build order, after the ones that are
+    questions.forEach(q => { if (!seen.has(q.key)) out.push(q); });
+    if (out.length === questions.length){
+      questions = out;
+      questions.forEach((q, i) => q.id = i);
+    }
+  }
+  if (arr.opts && typeof arr.opts === 'object'){
+    questions.forEach(q => {
+      const perm = arr.opts[q.key];
+      const orig = ORIG[q.key];
+      if (!perm || !orig || q.type === 'label') return;
+      if (perm.length !== orig.opts.length) return;              // bank changed
+      if (!perm.every(i => Number.isInteger(i) && orig.opts[i] !== undefined)) return;
+      if (new Set(perm).size !== perm.length) return;
+      q.opts = perm.map(i => orig.opts[i]);
+      q.ans = perm.indexOf(orig.ans);
+    });
+  }
+}
+
 // ---------- localStorage persistence ----------
 /* `view` restores which topics are ticked, the active filter and the retry set.
    That is this device's view of the quiz, not progress, so it is restored from
@@ -482,6 +538,10 @@ function loadProgress(opts){
     // Translate those through LEGACY_KEYS; drop any that cannot be translated rather
     // than letting them land on whatever question now occupies that slot.
     const legacy = (data.v || 1) < 2;
+    // The arrangement comes first: answers are resolved against the options as
+    // they are about to be shown, so the shuffle has to be back in place before
+    // any of them are read.
+    if(withView) applyArrangement(data.arrangement);
     const byKey = new Map();
     (data.questions || []).forEach(sq => {
       let k = (sq.key !== undefined ? sq.key : sq.id);
@@ -506,10 +566,29 @@ function loadProgress(opts){
       }
       // A saved entry only carries the fields that were actually set, so coalesce
       // rather than assigning undefined into the question's state.
-      q.selected = (saved.selected === undefined) ? null : saved.selected;
+      // `sel` is the chosen option's text and survives any reordering. Saves
+      // written before that change hold a position instead: read it against the
+      // order the build published, which is the order it was saved against.
+      if(saved.sel !== undefined){
+        const at = q.opts.indexOf(saved.sel);
+        q.selected = at >= 0 ? at : null;
+      } else if(saved.selected !== undefined && saved.selected !== null){
+        const orig = ORIG[q.key];
+        const text = orig && orig.opts[saved.selected];
+        const at = text === undefined ? -1 : q.opts.indexOf(text);
+        q.selected = at >= 0 ? at : null;
+      } else {
+        q.selected = null;
+      }
       q.flagged = !!saved.flagged;
       q.revealed = !!saved.revealed;
-      if(saved.struck) q.struck = saved.struck;
+      if(Array.isArray(saved.struckText)){
+        q.struck = saved.struckText.map(t => q.opts.indexOf(t)).filter(i => i >= 0);
+      } else if(Array.isArray(saved.struck)){
+        const orig = ORIG[q.key];
+        q.struck = orig ? saved.struck.map(i => q.opts.indexOf(orig.opts[i])).filter(i => i >= 0)
+                        : saved.struck;
+      }
       // The tray order is only restored when the save holds the SAME chips. Revise a
       // figure's answers and the old order would otherwise keep handing out the terms
       // that were replaced -- the new answers simply never appear in the tray.
@@ -579,10 +658,19 @@ function questionState(q){
     if (q.flagged) st.flagged = true;
     return st;
   }
-  if (q.selected !== null && q.selected !== undefined){ st.selected = q.selected; any = true; }
+  // An answer is stored as the TEXT of the option chosen, not its position.
+  // Shuffle reorders the options, and a position saved against one order means a
+  // different answer under another -- which also made answers unreadable on a
+  // second device, since only the shuffling device had that order.
+  if (q.selected !== null && q.selected !== undefined){
+    st.sel = q.opts[q.selected]; any = true;
+  }
   if (q.flagged){ st.flagged = true; any = true; }
   if (q.revealed){ st.revealed = true; any = true; }
-  if (q.type !== 'label' && q.struck && q.struck.length){ st.struck = q.struck; any = true; }
+  if (q.type !== 'label' && q.struck && q.struck.length){
+    st.struckText = q.struck.map(i => q.opts[i]).filter(t => t !== undefined);
+    any = true;
+  }
   if (q.type === 'label'){
     if (q.placed && Object.keys(q.placed).length){ st.placed = q.placed; any = true; }
     if (q.userPlaced){ st.userPlaced = true; any = true; }
@@ -601,6 +689,7 @@ function buildPayload(){
     knownSections: Array.from(new Set(questions.map(q => q.section))),
     statusMode: statusMode,
     retrySet: retrySet,
+    arrangement: currentArrangement(),
     stats: stats,
     savedAt: new Date().toISOString()
   };
@@ -665,13 +754,20 @@ function mergeQuestion(older, newer){
     return t;
   }
   const m = { key: newer.key };
-  ['selected', 'revealed', 'userPlaced', 'chipOrder'].forEach(f => {
+  // `sel` and `struckText` name the option chosen rather than its position; the
+  // positional forms are still read from saves written before that change. Any
+  // field left out of this list is silently dropped by a merge, which is how a
+  // sync can quietly erase the very thing it is meant to carry.
+  ['sel', 'selected', 'revealed', 'userPlaced', 'chipOrder'].forEach(f => {
     const v = (newer[f] !== undefined) ? newer[f] : older[f];
     if (v !== undefined) m[f] = v;
   });
+  if (m.sel !== undefined) delete m.selected;      // the text wins; drop the stale position
   if (older.flagged || newer.flagged) m.flagged = true;
+  const struckText = Array.from(new Set([].concat(older.struckText || [], newer.struckText || [])));
+  if (struckText.length) m.struckText = struckText;
   const struck = Array.from(new Set([].concat(older.struck || [], newer.struck || [])));
-  if (struck.length) m.struck = struck;
+  if (struck.length && !struckText.length) m.struck = struck;
   // Take one side's placements whole. Merging two grids cell by cell could put a
   // term in more cells than the tray has chips for, which is not a valid state.
   const placed = (newer.placed && Object.keys(newer.placed).length) ? newer.placed : older.placed;
@@ -724,6 +820,7 @@ function mergeProgress(a, b){
     knownSections: Array.from(new Set([].concat(older.knownSections || [], newer.knownSections || []))),
     statusMode: newer.statusMode || older.statusMode || 'all',
     retrySet: newer.retrySet || older.retrySet || [],
+    arrangement: newer.arrangement || older.arrangement || null,
     stats: mergeStats(older, newer),
     savedAt: newer.savedAt
   };
@@ -736,7 +833,8 @@ function applyPayload(data){
   data = Object.assign({}, data, {
     selectedModules: Array.from(selectedModules),
     statusMode: statusMode,
-    retrySet: retrySet
+    retrySet: retrySet,
+    arrangement: currentArrangement()
   });
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e){}
   questions.forEach(q => {
@@ -809,7 +907,8 @@ async function pushNow(payload){
         localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.assign({}, merged, {
           selectedModules: Array.from(selectedModules),
           statusMode: statusMode,
-          retrySet: retrySet
+          retrySet: retrySet,
+          arrangement: currentArrangement()
         })));
       } catch(e){}
     }
@@ -1326,6 +1425,7 @@ function updateCounts(){
   document.getElementById('filterCount').textContent =
     `Showing ${shown} of ${questions.length} questions across ${selectedModules.size} topic${selectedModules.size===1?'':'s'}  •  🚩 ${flagged} flagged  •  ✗ ${incorrect} incorrect`;
   updateRetryControls();
+  updateOrderControls();
 }
 
 function showAnswers(){
@@ -1359,32 +1459,94 @@ function resetQuiz(){
   setTimeout(() => { document.getElementById('saveStatus').textContent=''; }, 4000);
 }
 
+/* Reorders the questions and the options inside them, and KEEPS the work. It
+   used to wipe every answer, because an answer was a position and the positions
+   were about to move; now an answer is the option's text, so it is simply
+   followed to wherever that option lands. The arrangement is saved, so it is
+   still there after a reload -- going through the bank in a random order no
+   longer costs a session's progress every time. */
 function shuffleQuiz(){
-  retrySet = [];                       // a shuffle is a fresh start, not a retry round
-  if (statusMode === 'retry') statusMode = 'all';
-  questions.forEach(q => { if (hasWork(q)) clearedKeys.add(q.key); });
-  // Shuffle the questions array order
-  for (let i=questions.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [questions[i],questions[j]]=[questions[j],questions[i]]; }
-  // Reassign question IDs to match new positions (CRITICAL: prevents answer misalignment)
-  questions.forEach((q, i) => q.id = i);
-  // Shuffle answer options within each question
+  for (let i = questions.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [questions[i], questions[j]] = [questions[j], questions[i]];
+  }
+  questions.forEach((q, i) => q.id = i);   // ids are positions; keys identify questions
   questions.forEach(q => {
     if (isLabel(q)){
-      q.placed = {}; q.userPlaced = false; q.revealed = false;
+      // the markers keep their answers: a placement names a term, not a position
       q.chipOrder = shuffledChips(q);
       return;
     }
-    const opts = q.opts;
-    const correctVal = opts[q.ans];
-    for (let i=opts.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [opts[i],opts[j]]=[opts[j],opts[i]]; }
-    q.ans = opts.indexOf(correctVal);
-    q.selected = null; q.revealed = false;
-    q.struck = [];          // option order changed, so old eliminations no longer apply
+    const chosen = (q.selected !== null && q.selected !== undefined) ? q.opts[q.selected] : null;
+    const struckText = (q.struck || []).map(i => q.opts[i]);
+    const correctVal = q.opts[q.ans];
+    for (let i = q.opts.length - 1; i > 0; i--){
+      const j = Math.floor(Math.random() * (i + 1));
+      [q.opts[i], q.opts[j]] = [q.opts[j], q.opts[i]];
+    }
+    q.ans = q.opts.indexOf(correctVal);
+    q.selected = chosen === null ? null : q.opts.indexOf(chosen);
+    q.struck = struckText.map(t => q.opts.indexOf(t)).filter(i => i >= 0);
+  });
+  // the retry set travels by key, so a reshuffle no longer empties it
+  updateScore();
+  renderQuiz();
+  updateCounts();
+  autoSave();
+  document.getElementById('saveStatus').textContent = 'Shuffled - your answers came with it';
+  setTimeout(() => { document.getElementById('saveStatus').textContent = ''; }, 4000);
+  window.scrollTo({top:0, behavior:'smooth'});
+  updateOrderControls();
+}
+
+/* True when anything about the current arrangement differs from the build: the
+   question order, or the option order inside any question. */
+function isShuffled(){
+  if (questions.length !== BUILD_ORDER.length) return true;
+  if (questions.some((q, i) => q.key !== BUILD_ORDER[i])) return true;
+  return questions.some(q => {
+    const orig = ORIG[q.key];
+    if (!orig || isLabel(q)) return false;
+    return q.opts.length !== orig.opts.length || q.opts.some((t, i) => t !== orig.opts[i]);
+  });
+}
+
+/* The way back out of a shuffle: the questions and their options return to the
+   order the quiz was published in. Answers are followed by text, exactly as the
+   shuffle follows them, so putting the order back costs no progress either.
+   currentArrangement() reports nothing once this matches the build, so the save
+   written here clears the stored shuffle rather than recording another one. */
+function restoreOrder(){
+  const pos = new Map(BUILD_ORDER.map((k, i) => [k, i]));
+  // questions a later build added are not in BUILD_ORDER; leave them at the end
+  questions.sort((a, b) => (pos.has(a.key) ? pos.get(a.key) : Infinity) -
+                           (pos.has(b.key) ? pos.get(b.key) : Infinity));
+  questions.forEach((q, i) => q.id = i);
+  questions.forEach(q => {
+    const orig = ORIG[q.key];
+    if (!orig || isLabel(q)) return;
+    const chosen = (q.selected !== null && q.selected !== undefined) ? q.opts[q.selected] : null;
+    const struckText = (q.struck || []).map(i => q.opts[i]);
+    q.opts = orig.opts.slice();
+    q.ans = orig.ans;
+    q.selected = chosen === null ? null : q.opts.indexOf(chosen);
+    if (q.selected === -1) q.selected = null;                    // option no longer exists
+    q.struck = struckText.map(t => q.opts.indexOf(t)).filter(i => i >= 0);
   });
   updateScore();
   renderQuiz();
+  updateCounts();
   autoSave();
-  window.scrollTo({top:0,behavior:'smooth'});
+  document.getElementById('saveStatus').textContent = 'Back to the original order - your answers came with it';
+  setTimeout(() => { document.getElementById('saveStatus').textContent = ''; }, 4000);
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+/* The button is only meaningful while the order has been changed, so it is only
+   there then -- including after a reload that restored a saved shuffle. */
+function updateOrderControls(){
+  const btn = document.getElementById('orderBtn');
+  if (btn) btn.style.display = isShuffled() ? '' : 'none';
 }
 
 
