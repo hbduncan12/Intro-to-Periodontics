@@ -395,7 +395,40 @@ let stats = emptyStats();
 /* `since` is null until the person resets. It must NOT default to "now": it is
    the floor used when merging, so a fresh device claiming a reset at startup
    would wipe the history held on the account the first time it pushed. */
-function emptyStats(){ return { since: null, attempts: {} }; }
+function emptyStats(){ return { since: null, seeded: false, attempts: {} }; }
+
+/* Work answered before the record existed still says something about where a
+   person stands, so it is folded in once: one attempt per question that already
+   carries an answer, marked right or wrong from that answer.
+
+   Those entries are stamped time 0 rather than "now". Two devices both holding
+   the same synced progress would otherwise each seed their own copy and the
+   union would count every question twice; with a fixed stamp the two strings
+   are identical and the union collapses them. Time 0 also reads correctly as
+   "from before tracking started" when the rows show when a topic was last seen.
+
+   It happens once. `seeded` is set here and by a reset, so clearing the record
+   cannot be undone by the next page load. */
+function maybeSeedFromAnswers(){
+  if (!stats || stats.seeded) return 0;
+  let n = 0;
+  questions.forEach(q => {
+    if ((stats.attempts[q.key] || []).length) return;
+    let answered, correct;
+    if (isLabel(q)){
+      answered = labelIsComplete(q);
+      correct = answered && labelIsCorrect(q);
+    } else {
+      answered = (q.selected !== null && q.selected !== undefined);
+      correct = answered && q.selected === q.ans;
+    }
+    if (!answered) return;
+    stats.attempts[q.key] = ['0:' + (correct ? 1 : 0)];
+    n++;
+  });
+  stats.seeded = true;
+  return n;
+}
 
 function recordAttempt(q, correct){
   if (!q || q.key === undefined) return;
@@ -499,6 +532,7 @@ function loadProgress(opts){
     // the browser, so it is restored from a synced payload as well as a local one.
     if(data.stats && typeof data.stats === 'object'){
       stats = { since: data.stats.since || null,
+                seeded: !!data.stats.seeded,
                 attempts: (data.stats.attempts && typeof data.stats.attempts === 'object')
                   ? data.stats.attempts : {} };
     }
@@ -655,7 +689,7 @@ function mergeStats(a, b){
   if (!B || !B.attempts) return A;
   const since = (Date.parse(A.since) || 0) >= (Date.parse(B.since) || 0) ? A.since : B.since;
   const floor = Math.floor((Date.parse(since) || 0) / 1000);
-  const out = { since: since, attempts: {} };
+  const out = { since: since, seeded: !!(A.seeded || B.seeded), attempts: {} };
   const keys = new Set(Object.keys(A.attempts).concat(Object.keys(B.attempts)));
   keys.forEach(k => {
     const seen = Array.from(new Set([].concat(A.attempts[k] || [], B.attempts[k] || [])))
@@ -711,6 +745,7 @@ function applyPayload(data){
   });
   clearedKeys = new Set();
   loadProgress({ view: false });
+  maybeSeedFromAnswers();
   document.querySelectorAll('.topic-cb').forEach(cb => { cb.checked = selectedModules.has(cb.value); });
   renderQuiz(); updateScore(); updateCounts();
 }
@@ -879,7 +914,7 @@ function clearAllData(){
   clearArmed = false;
   retrySet = [];
   clearedKeys = new Set();
-  stats = { since: new Date().toISOString(), attempts: {} };   // a wipe is a reset
+  stats = { since: new Date().toISOString(), seeded: true, attempts: {} };  // a wipe is a reset
   try { localStorage.removeItem(STORAGE_KEY); } catch(e){}
   questions.forEach(q => { q.selected = null; q.flagged = false; q.revealed = false; q.struck = [];
     if (isLabel(q)){ q.placed = {}; q.userPlaced = false; q.chipOrder = null; } });
@@ -922,7 +957,7 @@ function topicStats(){
       const bits = e.split(':');
       s.attempts++;
       if (bits[1] === '1') s.correct++;
-      const t = parseInt(bits[0], 10) || 0;
+      const t = parseInt(bits[0], 10) || 0;   // 0 = folded in from an older answer
       if (t > s.last) s.last = t;
     });
   });
@@ -958,11 +993,14 @@ function renderInsights(){
   const total = questions.length;
   const weak = rows.filter(r => r.band === 'weak');
 
-  const earliest = Object.values(stats.attempts).reduce((m, l) => {
-    const t = parseInt(l[0], 10) || 0; return (!m || (t && t < m)) ? t : m; }, 0);
+  // the earliest real timestamp; folded-in answers carry 0 and have no date
+  const earliest = Object.values(stats.attempts).reduce((m, l) => l.reduce((n, e) => {
+    const t = parseInt(e, 10) || 0;
+    return t && (!n || t < n) ? t : n; }, m), 0);
   const sinceMs = stats.since ? Date.parse(stats.since) : (earliest ? earliest * 1000 : 0);
   document.getElementById('insSince').textContent =
-    attempts ? 'Tracking since ' + fmtDay(sinceMs) : '';
+    !attempts ? '' : sinceMs ? 'Tracking since ' + fmtDay(sinceMs)
+                             : 'Includes answers given before tracking started';
 
   const btn = document.getElementById('insWeakBtn');
   if (btn) btn.style.display = weak.length ? '' : 'none';
@@ -1003,7 +1041,8 @@ function renderInsights(){
       : `${r.section}: ${pct(r.acc)} correct from ${r.attempts} answered`;
     return `<div class="meter">
       <div><div class="name">${esc(r.section)}</div>
-        <div class="sub">${r.seen} of ${r.total} questions tried &middot; last ${fmtDay(r.last * 1000)}</div></div>
+        <div class="sub">${r.seen} of ${r.total} questions tried &middot; ${
+          r.last ? 'last ' + fmtDay(r.last * 1000) : 'from answers given earlier'}</div></div>
       <div class="track" role="img" aria-label="${esc(label)}" title="${esc(label)}">
         <div class="fill" style="width:${w}%${r.thin ? ';background:#aebfcd' : ''}"></div></div>
       <div class="fig"${r.thin ? ' style="color:var(--muted)"' : ''}>${fig}</div>
@@ -1058,7 +1097,7 @@ function resetInsights(){
   btn.textContent = 'Reset insights';
   // A real reset, not an empty start: `since` is stamped so the clear survives a
   // merge with a device that still holds the old attempts.
-  stats = { since: new Date().toISOString(), attempts: {} };
+  stats = { since: new Date().toISOString(), seeded: true, attempts: {} };
   saveProgress();
   renderInsights();
   const note = document.getElementById('insNote');
@@ -1746,6 +1785,9 @@ function updateRetryControls(){
 }
 
 loadProgress();
+// answers that predate the record are folded in once, so the panel is useful
+// on the first visit rather than only after more questions are answered
+maybeSeedFromAnswers();
 buildModulePanel();
 document.querySelectorAll('.topic-cb').forEach(cb => { cb.checked = selectedModules.has(cb.value); });
 document.getElementById('filter-'+statusMode).classList.add('active');
