@@ -201,6 +201,51 @@ footer{max-width:980px;margin:0 auto 40px;padding:0 16px;color:var(--muted);font
   padding:9px 13px;margin:10px 0 0;font-size:13.3px;display:none;align-items:center;
   justify-content:space-between;gap:10px;flex-wrap:wrap;}
 .retry-note button{padding:5px 11px;font-size:12.5px;}
+
+/* ---------- insights -------------------------------------------------------
+   A meter list: one row per topic, each a ratio against its own whole, sorted
+   weakest first. Bars are one hue and encode magnitude only; the band each
+   topic falls in is named in words on the pill, so nothing is carried by
+   colour alone. */
+.insights{display:none;border:1px solid var(--line);border-radius:14px;background:#fff;
+  padding:16px 18px 14px;margin:0 0 14px;}
+.insights.on{display:block;}
+.ins-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  margin-bottom:14px;}
+.ins-head h2{margin:0;font-size:17px;color:var(--navy);}
+.ins-since{font-size:12.3px;color:var(--muted);}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;}
+.kpi{flex:1 1 150px;border:1px solid var(--line);border-radius:12px;padding:10px 13px;background:#fbfdff;}
+.kpi .v{font-size:30px;line-height:1.1;font-weight:700;color:var(--navy);letter-spacing:-.5px;}
+.kpi .l{font-size:12.2px;color:var(--muted);margin-top:3px;}
+.kpi .s{font-size:11.8px;color:var(--muted);margin-top:2px;}
+.meters{display:flex;flex-direction:column;gap:2px;}
+.meter{display:grid;grid-template-columns:minmax(150px,1.45fr) minmax(90px,2fr) auto auto;
+  align-items:center;gap:12px;padding:7px 6px;border-radius:9px;}
+.meter:hover{background:#f7fafd;}
+.meter .name{font-size:13.6px;color:var(--ink);font-weight:600;}
+.meter .sub{font-size:11.6px;color:var(--muted);font-weight:400;margin-top:1px;}
+.track{height:10px;border-radius:5px;background:#eaf0f5;overflow:hidden;}
+.fill{height:100%;border-radius:5px;background:var(--steel);}
+.meter .fig{font-size:13.6px;font-weight:700;color:var(--navy);min-width:52px;text-align:right;
+  font-variant-numeric:tabular-nums;}
+.pill{font-size:11.4px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap;}
+.pill.weak{background:#fdeeee;color:#8f2f2f;}
+.pill.mid{background:#fdf3e0;color:#7a5410;}
+.pill.good{background:#e8f7ef;color:#1d6b47;}
+.pill.thin{background:#eef2f6;color:#52657a;}
+.meter .act{background:none;border:1px solid var(--line);color:var(--steel);border-radius:8px;
+  padding:4px 10px;font-size:12px;cursor:pointer;}
+.meter .act:hover{background:var(--sky);border-color:var(--steel);}
+.ins-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  margin-top:14px;padding-top:12px;border-top:1px solid var(--line);}
+.ins-untouched{font-size:12.4px;color:var(--muted);margin-top:12px;line-height:1.5;}
+.ins-empty{font-size:13.5px;color:var(--muted);padding:6px 0 2px;}
+@media (max-width:700px){
+  .meter{grid-template-columns:1fr auto;gap:6px 10px;}
+  .meter .track{grid-column:1 / -1;}
+  .meter .fig{text-align:left;}
+}
 </style>
 <meta name="robots" content="noindex, nofollow">
 </head>
@@ -231,11 +276,27 @@ footer{max-width:980px;margin:0 auto 40px;padding:0 16px;color:var(--muted);font
       <button class="ghost" onclick="shuffleQuiz()">Shuffle</button>
       <button class="ghost" onclick="showAnswers()">Show All Answers</button>
       <button class="retry-btn" id="retryBtn" style="display:none" onclick="retryVisible()"></button>
+      <button class="ghost" id="insightsBtn" onclick="toggleInsights()">📊 Insights</button>
       <button class="save" onclick="saveAndShowStatus()">💾 Save Progress</button>
       <button class="danger" onclick="clearAllData()">Clear Saved Data</button>
       <span class="save-status" id="saveStatus"></span>
     </div>
   </div>
+
+  <section class="insights" id="insights" aria-label="Performance by topic">
+    <div class="ins-head">
+      <h2>Where you stand</h2>
+      <span class="ins-since" id="insSince"></span>
+    </div>
+    <div id="insightsBody"></div>
+    <div class="ins-foot">
+      <span class="ins-since" id="insNote"></span>
+      <span style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="ghost" id="insWeakBtn" onclick="practiceWeakest()" style="display:none">Practice my weak topics</button>
+        <button class="danger" id="insResetBtn" onclick="resetInsights()">Reset insights</button>
+      </span>
+    </div>
+  </section>
 
   <div style="margin-bottom:12px;">
     <label style="display:block;font-size:13.5px;font-weight:600;margin-bottom:8px;color:var(--navy);">Topics</label>
@@ -315,6 +376,33 @@ let saveTimer = null;
    question is indistinguishable from one never touched -- and a merge with the
    other side's older copy would hand the old answer straight back. */
 let clearedKeys = new Set();
+
+/* ---------- performance history ------------------------------------------
+   Progress records what each answer currently IS; stats record how it has
+   gone over time. They are kept apart on purpose: Reset Answers clears the
+   quiz without erasing the record, and Reset Insights clears the record
+   without disturbing the answers.
+
+   An attempt is stored as "<unix seconds>:<1 correct | 0 wrong>". Storing the
+   events rather than running totals is what makes two devices mergeable: the
+   union of two event lists is exact, whereas adding two counters double-counts
+   whatever both devices had already seen. `since` doubles as the reset
+   tombstone -- anything older than it is dropped on merge, so a reset on one
+   device is not undone by the other's copy. */
+const ATTEMPT_CAP = 40;          // per question; a longer tail tells you nothing
+let stats = emptyStats();
+
+/* `since` is null until the person resets. It must NOT default to "now": it is
+   the floor used when merging, so a fresh device claiming a reset at startup
+   would wipe the history held on the account the first time it pushed. */
+function emptyStats(){ return { since: null, attempts: {} }; }
+
+function recordAttempt(q, correct){
+  if (!q || q.key === undefined) return;
+  const list = stats.attempts[q.key] || (stats.attempts[q.key] = []);
+  list.push(Math.floor(Date.now() / 1000) + ':' + (correct ? 1 : 0));
+  if (list.length > ATTEMPT_CAP) list.splice(0, list.length - ATTEMPT_CAP);
+}
 const STORAGE_KEY = 'intro_periodontics_quiz_progress';
 const SAVE_VERSION = 2;                  // 1 = progress keyed by array index
 
@@ -407,6 +495,13 @@ function loadProgress(opts){
         }
       }
     });
+    // The record is progress, not view state: it belongs to the person, not to
+    // the browser, so it is restored from a synced payload as well as a local one.
+    if(data.stats && typeof data.stats === 'object'){
+      stats = { since: data.stats.since || null,
+                attempts: (data.stats.attempts && typeof data.stats.attempts === 'object')
+                  ? data.stats.attempts : {} };
+    }
     if(withView){
       if(data.selectedModules) selectedModules = new Set(data.selectedModules);
       // Topics added since this save was made are switched ON automatically, so new
@@ -472,6 +567,7 @@ function buildPayload(){
     knownSections: Array.from(new Set(questions.map(q => q.section))),
     statusMode: statusMode,
     retrySet: retrySet,
+    stats: stats,
     savedAt: new Date().toISOString()
   };
 }
@@ -549,6 +645,27 @@ function mergeQuestion(older, newer){
   return m;
 }
 
+/* Two devices each hold part of the record. Attempts are events, so the union of
+   the two lists is the whole history with no double counting -- and `since`, the
+   last reset, is the floor: anything recorded before the later of the two resets
+   was already cleared on purpose and does not come back. */
+function mergeStats(a, b){
+  const A = a && a.stats, B = b && b.stats;
+  if (!A || !A.attempts) return B || null;
+  if (!B || !B.attempts) return A;
+  const since = (Date.parse(A.since) || 0) >= (Date.parse(B.since) || 0) ? A.since : B.since;
+  const floor = Math.floor((Date.parse(since) || 0) / 1000);
+  const out = { since: since, attempts: {} };
+  const keys = new Set(Object.keys(A.attempts).concat(Object.keys(B.attempts)));
+  keys.forEach(k => {
+    const seen = Array.from(new Set([].concat(A.attempts[k] || [], B.attempts[k] || [])))
+      .filter(s => (parseInt(s, 10) || 0) >= floor)
+      .sort((x, y) => (parseInt(x, 10) || 0) - (parseInt(y, 10) || 0));
+    if (seen.length) out.attempts[k] = seen.slice(-ATTEMPT_CAP);
+  });
+  return out;
+}
+
 function mergeProgress(a, b){
   if (!a || !a.questions) return b;
   if (!b || !b.questions) return a;
@@ -573,6 +690,7 @@ function mergeProgress(a, b){
     knownSections: Array.from(new Set([].concat(older.knownSections || [], newer.knownSections || []))),
     statusMode: newer.statusMode || older.statusMode || 'all',
     retrySet: newer.retrySet || older.retrySet || [],
+    stats: mergeStats(older, newer),
     savedAt: newer.savedAt
   };
 }
@@ -761,6 +879,7 @@ function clearAllData(){
   clearArmed = false;
   retrySet = [];
   clearedKeys = new Set();
+  stats = { since: new Date().toISOString(), attempts: {} };   // a wipe is a reset
   try { localStorage.removeItem(STORAGE_KEY); } catch(e){}
   questions.forEach(q => { q.selected = null; q.flagged = false; q.revealed = false; q.struck = [];
     if (isLabel(q)){ q.placed = {}; q.userPlaced = false; q.chipOrder = null; } });
@@ -774,11 +893,176 @@ function clearAllData(){
         v: SAVE_VERSION, questions: [],
         selectedModules: Array.from(selectedModules),
         knownSections: Array.from(new Set(questions.map(q => q.section))),
-        statusMode: 'all', retrySet: [], savedAt: new Date().toISOString()
+        statusMode: 'all', retrySet: [], stats: stats,
+        savedAt: new Date().toISOString()
       }).catch(() => {}))
     : Promise.resolve();
   const reload = () => { document.getElementById('saveStatus').textContent = ''; location.reload(); };
   Promise.race([wipe, new Promise(r => setTimeout(r, 4000))]).then(() => setTimeout(reload, 800));
+}
+
+/* ---------- insights ------------------------------------------------------
+   A meter list: one row per topic, a ratio against its own whole, sorted so the
+   topic needing the most work is first. The bar encodes one thing (accuracy) in
+   one hue; the band is named in words beside it, so the reading never depends
+   on colour. Topics with too few answers to mean anything say so rather than
+   showing a flattering 100% off one lucky question. */
+const THIN_EVIDENCE = 5;        // fewer attempts than this and a percentage lies
+
+function topicStats(){
+  const by = new Map();
+  questions.forEach(q => {
+    let s = by.get(q.section);
+    if (!s){ s = {section: q.section, total: 0, seen: 0, attempts: 0, correct: 0, last: 0};
+             by.set(q.section, s); }
+    s.total++;
+    const list = stats.attempts[q.key] || [];
+    if (list.length) s.seen++;
+    list.forEach(e => {
+      const bits = e.split(':');
+      s.attempts++;
+      if (bits[1] === '1') s.correct++;
+      const t = parseInt(bits[0], 10) || 0;
+      if (t > s.last) s.last = t;
+    });
+  });
+  return Array.from(by.values()).map(s => {
+    s.acc = s.attempts ? s.correct / s.attempts : null;
+    s.thin = s.attempts > 0 && s.attempts < THIN_EVIDENCE;
+    s.band = s.attempts === 0 ? 'none' : s.thin ? 'thin'
+           : s.acc >= 0.85 ? 'good' : s.acc >= 0.70 ? 'mid' : 'weak';
+    return s;
+  });
+}
+
+const BAND_WORD = {weak: 'Needs work', mid: 'Getting there', good: 'Strong',
+                   thin: 'Too few to tell', none: 'Not started'};
+
+function esc(s){ return String(s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function fmtDay(ms){
+  try { return new Date(ms).toLocaleDateString(undefined,
+    {year: 'numeric', month: 'short', day: 'numeric'}); } catch(e){ return ''; }
+}
+
+function renderInsights(){
+  const panel = document.getElementById('insights');
+  if (!panel || !panel.classList.contains('on')) return;
+  const body = document.getElementById('insightsBody');
+  const rows = topicStats();
+  const tried = rows.filter(r => r.attempts > 0);
+  const attempts = rows.reduce((n, r) => n + r.attempts, 0);
+  const correct = rows.reduce((n, r) => n + r.correct, 0);
+  const seen = rows.reduce((n, r) => n + r.seen, 0);
+  const total = questions.length;
+  const weak = rows.filter(r => r.band === 'weak');
+
+  const earliest = Object.values(stats.attempts).reduce((m, l) => {
+    const t = parseInt(l[0], 10) || 0; return (!m || (t && t < m)) ? t : m; }, 0);
+  const sinceMs = stats.since ? Date.parse(stats.since) : (earliest ? earliest * 1000 : 0);
+  document.getElementById('insSince').textContent =
+    attempts ? 'Tracking since ' + fmtDay(sinceMs) : '';
+
+  const btn = document.getElementById('insWeakBtn');
+  if (btn) btn.style.display = weak.length ? '' : 'none';
+
+  if (!attempts){
+    body.innerHTML = '<p class="ins-empty">Answer a few questions and this fills in: '
+      + 'accuracy for every topic, weakest first, so you can see where the time '
+      + 'is worth spending.</p>';
+    document.getElementById('insNote').textContent = '';
+    return;
+  }
+
+  // weakest first; topics never attempted go last, in their own line
+  const order = {weak: 0, mid: 1, good: 2, thin: 3};
+  tried.sort((a, b) => (order[a.band] - order[b.band]) || (a.acc - b.acc)
+                        || b.attempts - a.attempts);
+
+  const pct = n => Math.round(n * 100) + '%';
+  const kpis = `<div class="kpis">
+    <div class="kpi"><div class="v">${pct(correct / attempts)}</div>
+      <div class="l">Overall accuracy</div>
+      <div class="s">${correct} right of ${attempts} answered</div></div>
+    <div class="kpi"><div class="v">${seen}<span style="font-size:17px;color:var(--muted)"> / ${total}</span></div>
+      <div class="l">Questions covered</div>
+      <div class="s">${pct(seen / total)} of the bank</div></div>
+    <div class="kpi"><div class="v">${weak.length}</div>
+      <div class="l">Topic${weak.length === 1 ? '' : 's'} needing work</div>
+      <div class="s">under 70% correct</div></div>
+  </div>`;
+
+  const meters = tried.map(r => {
+    const w = Math.max(2, Math.round(r.acc * 100));
+    // Too few answers to support a percentage: show the tally instead, and mute
+    // the bar, so a lucky 1 of 1 does not read as mastery.
+    const fig = r.thin ? `${r.correct}/${r.attempts}` : pct(r.acc);
+    const label = r.thin
+      ? `${r.section}: ${r.correct} right of ${r.attempts} answered, too few to judge`
+      : `${r.section}: ${pct(r.acc)} correct from ${r.attempts} answered`;
+    return `<div class="meter">
+      <div><div class="name">${esc(r.section)}</div>
+        <div class="sub">${r.seen} of ${r.total} questions tried &middot; last ${fmtDay(r.last * 1000)}</div></div>
+      <div class="track" role="img" aria-label="${esc(label)}" title="${esc(label)}">
+        <div class="fill" style="width:${w}%${r.thin ? ';background:#aebfcd' : ''}"></div></div>
+      <div class="fig"${r.thin ? ' style="color:var(--muted)"' : ''}>${fig}</div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span class="pill ${r.band}">${BAND_WORD[r.band]}</span>
+        <button class="act" onclick="practiceTopic('${esc(r.section).replace(/'/g, "\\'")}')">Practice</button>
+      </div></div>`;
+  }).join('');
+
+  const untouched = rows.filter(r => r.attempts === 0).map(r => r.section);
+  const tail = untouched.length
+    ? `<p class="ins-untouched"><strong>Not started yet:</strong> ${untouched.map(esc).join(' &middot; ')}</p>`
+    : '';
+
+  body.innerHTML = kpis + '<div class="meters">' + meters + '</div>' + tail;
+  document.getElementById('insNote').textContent =
+    'Each question counts once per attempt; answering it again after a reset counts again.';
+}
+
+function toggleInsights(){
+  const panel = document.getElementById('insights');
+  const on = !panel.classList.contains('on');
+  panel.classList.toggle('on', on);
+  document.getElementById('insightsBtn').textContent = on ? '📊 Hide insights' : '📊 Insights';
+  if (on){ renderInsights(); panel.scrollIntoView({behavior: 'smooth', block: 'nearest'}); }
+}
+
+function practiceTopic(section){
+  document.querySelectorAll('.topic-cb').forEach(c => c.checked = (c.value === section));
+  onModuleChange();
+  setStatus('all');
+}
+
+function practiceWeakest(){
+  const weak = new Set(topicStats().filter(r => r.band === 'weak').map(r => r.section));
+  if (!weak.size) return;
+  document.querySelectorAll('.topic-cb').forEach(c => c.checked = weak.has(c.value));
+  onModuleChange();
+  setStatus('all');
+}
+
+let insResetArmed = false;
+function resetInsights(){
+  const btn = document.getElementById('insResetBtn');
+  if (!insResetArmed){
+    insResetArmed = true;
+    btn.textContent = 'Click again to clear the record';
+    setTimeout(() => { insResetArmed = false; btn.textContent = 'Reset insights'; }, 4000);
+    return;
+  }
+  insResetArmed = false;
+  btn.textContent = 'Reset insights';
+  // A real reset, not an empty start: `since` is stamped so the clear survives a
+  // merge with a device that still holds the old attempts.
+  stats = { since: new Date().toISOString(), attempts: {} };
+  saveProgress();
+  renderInsights();
+  const note = document.getElementById('insNote');
+  note.textContent = 'Record cleared. Your answers and flags are untouched.';
 }
 
 function getTimeAgo(d){
@@ -913,11 +1197,18 @@ function applyAnswerVisuals(qIdx){
 }
 
 function selectOption(qIdx, optIdx){
-  if (isStruck(questions[qIdx], optIdx)){ toggleStrike(qIdx, optIdx); return; }
-  questions[qIdx].selected = optIdx;
+  const q = questions[qIdx];
+  if (isStruck(q, optIdx)){ toggleStrike(qIdx, optIdx); return; }
+  // Only the first answer after a reset counts towards the record. Changing a
+  // choice on an already-answered question is a correction, not a new attempt,
+  // so clicking around cannot inflate the numbers.
+  const first = (q.selected === null || q.selected === undefined);
+  q.selected = optIdx;
+  if (first) recordAttempt(q, optIdx === q.ans);
   applyAnswerVisuals(qIdx);
   updateScore();
   updateCounts();
+  if (first) renderInsights();
   autoSave();
 }
 
@@ -1024,6 +1315,7 @@ function resetQuiz(){
   updateScore();
   renderQuiz();
   autoSave();
+  renderInsights();
   document.getElementById('saveStatus').textContent = 'Answers reset (flags kept)';
   setTimeout(() => { document.getElementById('saveStatus').textContent=''; }, 4000);
 }
@@ -1192,10 +1484,17 @@ function placeTerm(idx, zoneKey, term){
   const supply = all.filter(t => t === term).length;
   const held = Object.keys(p).filter(k => k !== zoneKey && p[k] === term);
   while (supply > 0 && held.length >= supply) delete p[held.shift()];
+  const wasComplete = labelIsComplete(q);
   p[zoneKey] = term;
   q.userPlaced = true;
+  // A figure counts once, at the moment its last marker is filled: before that
+  // it is half-answered, and afterwards a swap is a correction.
+  const nowComplete = labelIsComplete(q);
+  if (!wasComplete && nowComplete) recordAttempt(q, labelIsCorrect(q));
   rerenderLabel(idx);
-  updateScore(); updateCounts(); autoSave();
+  updateScore(); updateCounts();
+  if (!wasComplete && nowComplete) renderInsights();
+  autoSave();
 }
 
 function clearZone(idx, zoneKey){
